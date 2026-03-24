@@ -1,0 +1,22 @@
+# Binaries
+/zen-coder
+
+# Build/test artifacts
+/output_step_*.txt
+
+# OS files
+.DS_Store
+
+# Node
+node_modules/
+
+# Local config
+/config.yaml
+
+# Go build cache (if any local)
+*.test
+*.out
+
+# Editor
+.vscode/
+.idea/
