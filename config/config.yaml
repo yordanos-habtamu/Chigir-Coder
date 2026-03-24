@@ -1,0 +1,61 @@
+# ──────────────────────────────────────────────────────
+# zen-coder configuration
+# ──────────────────────────────────────────────────────
+# All values can be overridden via:
+#   1. CLI flags    (--model, --project, --api-key, etc.)
+#   2. Environment  (ZEN_API_KEY, ZEN_MODEL, ZEN_PROVIDER, etc.)
+#   3. This file
+# Priority: CLI flags > env vars > config file > defaults
+# ──────────────────────────────────────────────────────
+
+# ── Provider ─────────────────────────────────────────
+# Supported: openrouter, openai, anthropic, nvidia, ollama, custom
+provider: nvidia
+
+# ── Provider presets (auto-set base_url per provider) ─
+# openrouter  → https://openrouter.ai/api/v1
+# openai      → https://api.openai.com/v1
+# anthropic   → https://api.anthropic.com/v1
+# nvidia      → https://integrate.api.nvidia.com/v1
+# ollama      → http://localhost:11434/v1
+# custom      → uses base_url below
+base_url: "https://integrate.api.nvidia.com/v1/chat/completions"
+# leave empty to use provider preset
+# You can also set the full chat endpoint (..../v1/chat/completions)
+# and it will be normalized automatically.
+
+# ── Model ────────────────────────────────────────────
+# Default used for FREE usage: arcee-ai/trinity-large-preview:free
+# For NVIDIA, set the model to your available NIM model name.
+model: "qwen/qwen3.5-122b-a10b"
+
+# ── Skill Preset ─────────────────────────────────────
+# auto, landing-page, portfolio, dashboard, marketing, docs,
+# api, cli, refactor, tests, data-pipeline, react, next
+skill: auto
+
+# ── API Key ──────────────────────────────────────────
+api_key: ""   # set here or via ZEN_API_KEY
+
+
+# ── Project Path ─────────────────────────────────────
+project_path: "."
+
+# ── Token Budget ─────────────────────────────────────
+# Lowered to 300 to stay under the 318 token credit limit.
+max_tokens: 300
+
+# ── Execution ────────────────────────────────────────
+max_fix_retries: 1
+context_budget: 800
+command_allowlist: ["ls", "pwd", "mkdir", "touch", "cat", "echo", "cp", "mv", "git", "go", "npm", "npx", "node", "python", "python3", "pip", "pip3"]
+
+# ── Output Mode ──────────────────────────────────────
+# "human" = colorful CLI output
+# "json"  = machine-readable JSON (for Cline/Roo Code integration)
+output_mode: human
+
+# ── MCP Server ───────────────────────────────────────
+# Start as MCP (Model Context Protocol) server for IDE integration
+# Use: zen-coder serve
+mcp_port: 0   # 0 = use stdio transport (default for Cline/Roo Code)
