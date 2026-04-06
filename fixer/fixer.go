@@ -23,8 +23,8 @@ func New(client *models.Client, maxRetries int) *Fixer {
 
 // Fix sends broken code + error details to the LLM for correction.
 // Returns the fixed code or an error if all retries are exhausted.
-func (f *Fixer) Fix(brokenCode string, errorDetail string) (string, error) {
-	userPrompt := prompts.FixerPrompt(brokenCode, errorDetail)
+func (f *Fixer) Fix(brokenCode string, errorDetail string, taskDescription string, requiresContent bool) (string, error) {
+	userPrompt := prompts.FixerPrompt(brokenCode, errorDetail, taskDescription, requiresContent)
 	fixed, err := f.client.Chat(prompts.FixerSystem, userPrompt)
 	if err != nil {
 		return "", fmt.Errorf("fixer LLM call failed: %w", err)
@@ -44,14 +44,14 @@ func (f *Fixer) FixCommand(cmd string, output string, errorDetail string) (strin
 
 // FixWithRetry attempts to fix the code, validating each attempt.
 // validateFn should return (valid bool, reason string).
-func (f *Fixer) FixWithRetry(brokenCode string, errorDetail string, validateFn func(string) (bool, string)) (string, error) {
+func (f *Fixer) FixWithRetry(brokenCode string, errorDetail string, taskDescription string, requiresContent bool, validateFn func(string) (bool, string)) (string, error) {
 	code := brokenCode
 	reason := errorDetail
 
 	for attempt := 1; attempt <= f.maxRetries; attempt++ {
 		fmt.Printf("    🔄 Fix attempt %d/%d\n", attempt, f.maxRetries)
 
-		fixed, err := f.Fix(code, reason)
+		fixed, err := f.Fix(code, reason, taskDescription, requiresContent)
 		if err != nil {
 			return "", err
 		}
