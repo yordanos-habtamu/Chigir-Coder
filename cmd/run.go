@@ -20,6 +20,9 @@ import (
 	"github.com/yordanos-habtamu/PromptOs/models"
 	"github.com/yordanos-habtamu/PromptOs/planner"
 	"github.com/yordanos-habtamu/PromptOs/skills"
+	"github.com/yordanos-habtamu/PromptOs/state"
+	"github.com/yordanos-habtamu/PromptOs/supervisor"
+	"github.com/yordanos-habtamu/PromptOs/taskqueue"
 	"github.com/yordanos-habtamu/PromptOs/validator"
 	"github.com/yordanos-habtamu/PromptOs/workspace"
 )
@@ -119,10 +122,9 @@ func runPipeline(cmd *cobra.Command, args []string) error {
 
 	// ── Initialize components ──
 	client := models.NewClient(cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.MaxTokens)
-	plan := planner.New(client)
-	exec := executor.New(client, skillText, cfg.CommandAllow)
+	plan := planner.New(client, cfg.PlannerMaxTokens)
+	exec := executor.New(client, skillText, cfg.CommandAllow, cfg.TaskTimeoutSeconds, cfg.MaxTokensPerStep)
 	fix := fixer.New(client, cfg.MaxFixRetries)
-	ctxMgr := appctx.New(cfg.ContextBudget)
 
 	// Load persistent stores
 	learnStore, _ := learning.Load()
@@ -163,17 +165,35 @@ func runPipeline(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("planning failed: %w", err)
 	}
+	// Normalize task defaults
+	for i := range originalPlan.Tasks {
+		if originalPlan.Tasks[i].ID == 0 {
+			originalPlan.Tasks[i].ID = i + 1
+		}
+		if strings.TrimSpace(originalPlan.Tasks[i].Name) == "" {
+			originalPlan.Tasks[i].Name = fmt.Sprintf("Task %d", i+1)
+		}
+		if strings.TrimSpace(originalPlan.Tasks[i].Description) == "" {
+			originalPlan.Tasks[i].Description = originalPlan.Tasks[i].Name
+		}
+		if strings.TrimSpace(originalPlan.Tasks[i].Status) == "" {
+			originalPlan.Tasks[i].Status = "pending"
+		}
+		if originalPlan.Tasks[i].MaxRetries == 0 {
+			originalPlan.Tasks[i].MaxRetries = cfg.MaxFixRetries
+		}
+	}
 
 	if !jsonMode {
 		fmt.Println("\n📋 Generated Plan:")
-		for i, step := range originalPlan.Steps {
-			fmt.Printf("   %d. %s\n", i+1, step)
+		for i, task := range originalPlan.Tasks {
+			fmt.Printf("   %d. %s — %s\n", i+1, task.Name, task.Description)
 		}
 	}
 
 	// ── Step 3: Edit Plan ──
 	var editedPlan *models.Plan
-	if flagNoEdit || jsonMode {
+	if flagNoEdit || jsonMode || len(originalPlan.Tasks) > 0 {
 		// Skip editing in no-edit mode or JSON mode (machine integration)
 		editedPlan = originalPlan
 	} else {
@@ -186,7 +206,8 @@ func runPipeline(cmd *cobra.Command, args []string) error {
 			}
 			if !jsonMode {
 				fmt.Println("\n📋 Revised Plan:")
-				for i, step := range editedPlan.Steps {
+				revisedSteps := tasksToSteps(editedPlan.Tasks)
+				for i, step := range revisedSteps {
 					fmt.Printf("   %d. %s\n", i+1, step)
 				}
 			}
@@ -196,7 +217,9 @@ func runPipeline(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── Step 4: Diff & Learn ──
-	d := diff.DiffPlans(originalPlan, editedPlan)
+	origSteps := tasksToSteps(originalPlan.Tasks)
+	editedSteps := tasksToSteps(editedPlan.Tasks)
+	d := diff.DiffPlans(&models.Plan{Steps: origSteps}, &models.Plan{Steps: editedSteps})
 	if d.Changed {
 		if !jsonMode {
 			fmt.Println("\n📊 Plan changes detected:")
@@ -234,22 +257,281 @@ func runPipeline(cmd *cobra.Command, args []string) error {
 	}
 
 	// Build function references for the executor loop
-	validateFn := func(output string) (bool, string) {
-		return validator.Validate(output)
+	validateFn := func(output string, taskDesc string, goal string) (bool, string) {
+		return validator.ValidateForTask(output, taskDesc, goal)
 	}
-	fixFn := func(code string, reason string) (string, error) {
-		return fix.Fix(code, reason)
+	fixFn := func(code string, reason string, taskDesc string, requiresContent bool) (string, error) {
+		return fix.Fix(code, reason, taskDesc, requiresContent)
 	}
 	commandFixFn := func(cmd string, output string, reason string) (string, error) {
 		return fix.FixCommand(cmd, output, reason)
 	}
-	contextFn := func(currentCtx string, newOutput string) string {
-		return ctxMgr.Update(newOutput)
+	// Initialize state store
+	stateStore, stErr := state.New(input, *editedPlan)
+	if stErr == nil {
+		_ = stateStore.Save()
+		if !jsonMode {
+			fmt.Printf("  🧾 State file: %s\n", stateStore.Path())
+		}
+	} else if !jsonMode {
+		fmt.Printf("  ⚠️  Could not initialize state store: %v\n", stErr)
 	}
 
-	results, execErr := exec.ExecuteAll(editedPlan, "", validateFn, fixFn, commandFixFn, contextFn)
-	if execErr != nil && !jsonMode {
-		fmt.Printf("\n❌ Execution error: %v\n", execErr)
+	// Build deterministic task queue
+	queue := taskqueue.New(editedPlan.Tasks)
+	completed := map[int]bool{}
+	totalTasks := len(editedPlan.Tasks)
+	contextRoot := cfg.ProjectPath
+	if ws != nil {
+		contextRoot = ws.Root
+	}
+	goal := input
+	if strings.TrimSpace(editedPlan.Goal) != "" {
+		goal = editedPlan.Goal
+	}
+
+	var results []models.StepResult
+	for {
+		task := queue.Next(completed)
+		if task == nil {
+			break
+		}
+		attempt := 0
+		for {
+			attempt++
+			task.Status = "running"
+			if stateStore != nil {
+				stateStore.SetCurrentTask(task.ID)
+				stateStore.UpdateTask(*task)
+				_ = stateStore.Save()
+			}
+
+			fmt.Printf("\n⚡ Executing task %d/%d (attempt %d): %s\n", len(completed)+1, totalTasks, attempt, task.Name)
+
+			taskContext := appctx.BuildTaskContext(*task, contextRoot, cfg.ContextBudget)
+			if strings.TrimSpace(goal) != "" {
+				taskContext = "GOAL:\n" + goal + "\n\n" + taskContext
+			}
+			result, err := exec.ExecuteStep(*task, taskContext)
+			if err != nil {
+				if !jsonMode {
+					fmt.Printf("  ❌ Execution error: %v\n", err)
+				}
+				task.Error = err.Error()
+				task.Retries++
+				if task.Retries > task.MaxRetries {
+					decision, decErr := supervisor.Decide(client, *task, err.Error(), task.Retries, cfg.UseAISupervisor)
+					if decErr != nil && !jsonMode {
+						fmt.Printf("  ⚠️  Supervisor error: %v\n", decErr)
+					}
+					if !jsonMode {
+						fmt.Printf("  🧭 Supervisor: %s (%s)\n", decision.Action, decision.Reason)
+					}
+					if decision.Action == "retry" {
+						continue
+					}
+					if decision.Action == "modify" && strings.TrimSpace(decision.Modification) != "" {
+						task.Description = decision.Modification
+						task.Retries = 0
+						continue
+					}
+					if decision.Action == "skip" {
+						task.Status = "failed"
+						if stateStore != nil {
+							stateStore.MarkFailed(task.ID)
+							stateStore.UpdateTask(*task)
+							_ = stateStore.Save()
+						}
+						break
+					}
+					// abort default
+					task.Status = "failed"
+					if stateStore != nil {
+						stateStore.MarkFailed(task.ID)
+						stateStore.UpdateTask(*task)
+						_ = stateStore.Save()
+					}
+					return fmt.Errorf("aborted by supervisor: %s", decision.Reason)
+				}
+				continue
+			}
+
+			// If model returned plain content without blocks, wrap it into a FILE block.
+			if executor.RequiresContent(task.Description) && !validator.HasCompleteFileOrPatch(result.Output) {
+				if wrapped := wrapContentAsFile(result.Output, task.Description); wrapped != "" {
+					result.Output = wrapped
+				}
+			}
+
+			valid, reason := validateFn(result.Output, task.Description, goal)
+			if valid && cfg.UseAIValidator {
+				aiValid, aiReason, aiErr := validator.ValidateWithAI(client, result.Output)
+				if aiErr != nil && !jsonMode {
+					fmt.Printf("  ⚠️  AI validator error: %v\n", aiErr)
+				} else if !aiValid {
+					valid = false
+					reason = fmt.Sprintf("AI validator: %s", aiReason)
+				}
+			}
+			result.Valid = valid
+			if !valid {
+				if validator.IsFormatError(reason) {
+					if !jsonMode {
+						fmt.Printf("  ❌ Format error (no fix attempt): %s\n", reason)
+					}
+					task.Retries++
+					task.Error = reason
+					if task.Retries > task.MaxRetries {
+						decision, decErr := supervisor.Decide(client, *task, reason, task.Retries, cfg.UseAISupervisor)
+						if decErr != nil && !jsonMode {
+							fmt.Printf("  ⚠️  Supervisor error: %v\n", decErr)
+						}
+						if !jsonMode {
+							fmt.Printf("  🧭 Supervisor: %s (%s)\n", decision.Action, decision.Reason)
+						}
+						if decision.Action == "retry" {
+							continue
+						}
+						if decision.Action == "modify" && strings.TrimSpace(decision.Modification) != "" {
+							task.Description = decision.Modification
+							task.Retries = 0
+							continue
+						}
+						if decision.Action == "skip" {
+							task.Status = "failed"
+							if stateStore != nil {
+								stateStore.MarkFailed(task.ID)
+								stateStore.UpdateTask(*task)
+								_ = stateStore.Save()
+							}
+							break
+						}
+						task.Status = "failed"
+						if stateStore != nil {
+							stateStore.MarkFailed(task.ID)
+							stateStore.UpdateTask(*task)
+							_ = stateStore.Save()
+						}
+						return fmt.Errorf("aborted by supervisor: %s", decision.Reason)
+					}
+					continue
+				}
+				if !jsonMode {
+					fmt.Printf("  ⚠️  Validation failed: %s\n", reason)
+					fmt.Println("  🔧 Attempting fix...")
+				}
+				fixed, fixErr := fixFn(result.Output, reason, task.Description, executor.RequiresContent(task.Description))
+				if fixErr != nil {
+					if !jsonMode {
+						fmt.Printf("  ❌ Fix failed: %v\n", fixErr)
+					}
+				} else {
+					result.Output = fixed
+					result.Fixed = true
+					valid2, reason2 := validateFn(fixed, task.Description, goal)
+					result.Valid = valid2
+					if !valid2 && !jsonMode {
+						fmt.Printf("  ⚠️  Still invalid after fix: %s\n", reason2)
+					} else if !jsonMode {
+						fmt.Println("  ✅ Fixed successfully")
+					}
+				}
+				if !result.Valid {
+					task.Retries++
+					task.Error = reason
+					if task.Retries > task.MaxRetries {
+						decision, decErr := supervisor.Decide(client, *task, reason, task.Retries, cfg.UseAISupervisor)
+						if decErr != nil && !jsonMode {
+							fmt.Printf("  ⚠️  Supervisor error: %v\n", decErr)
+						}
+						if !jsonMode {
+							fmt.Printf("  🧭 Supervisor: %s (%s)\n", decision.Action, decision.Reason)
+						}
+						if decision.Action == "retry" {
+							continue
+						}
+						if decision.Action == "modify" && strings.TrimSpace(decision.Modification) != "" {
+							task.Description = decision.Modification
+							task.Retries = 0
+							continue
+						}
+						if decision.Action == "skip" {
+							task.Status = "failed"
+							if stateStore != nil {
+								stateStore.MarkFailed(task.ID)
+								stateStore.UpdateTask(*task)
+								_ = stateStore.Save()
+							}
+							break
+						}
+						task.Status = "failed"
+						if stateStore != nil {
+							stateStore.MarkFailed(task.ID)
+							stateStore.UpdateTask(*task)
+							_ = stateStore.Save()
+						}
+						return fmt.Errorf("aborted by supervisor: %s", decision.Reason)
+					}
+					continue
+				}
+			} else if !jsonMode {
+				fmt.Println("  ✅ Valid output")
+			}
+
+			results = append(results, *result)
+
+			// Execute explicit shell commands
+			shellCmds := executor.ExtractShellCommands(result.Output)
+			for _, fullCmd := range shellCmds {
+				fmt.Printf("  🖥️  Executing Shell: %s\n", fullCmd)
+				out, err := executor.ExecCommandAllow(fullCmd, cfg.CommandAllow)
+				if err != nil && !jsonMode {
+					fmt.Printf("  ❌ Shell Error: %v\n", err)
+					if commandFixFn != nil {
+						fixedOutput, fixErr := commandFixFn(fullCmd, out, err.Error())
+						if fixErr != nil {
+							fmt.Printf("  ❌ Command fix failed: %v\n", fixErr)
+						} else if strings.TrimSpace(fixedOutput) != "" {
+							for _, fixCmd := range executor.ExtractShellCommands(fixedOutput) {
+								fmt.Printf("  🛠️  Applying fix: %s\n", fixCmd)
+								if _, fxErr := executor.ExecCommandAllow(fixCmd, cfg.CommandAllow); fxErr != nil {
+									fmt.Printf("  ❌ Fix command error: %v\n", fxErr)
+								}
+							}
+							results = append(results, models.StepResult{
+								StepIndex: task.ID,
+								Step:      task.Description,
+								Output:    fixedOutput,
+								Valid:     true,
+								Fixed:     true,
+							})
+						}
+					}
+				} else if out != "" && !jsonMode {
+					fmt.Printf("  ✅ Shell Output: %s\n", out)
+				}
+			}
+
+			if result.Valid {
+				task.Status = "done"
+				task.Output = result.Output
+				completed[task.ID] = true
+				if stateStore != nil {
+					stateStore.MarkCompleted(task.ID)
+					stateStore.UpdateTask(*task)
+					_ = stateStore.Save()
+				}
+			} else {
+				task.Status = "failed"
+				task.Error = "validation failed"
+				if stateStore != nil {
+					stateStore.MarkFailed(task.ID)
+					stateStore.UpdateTask(*task)
+					_ = stateStore.Save()
+				}
+			}
+			break
+		}
 	}
 
 	// ── Step 6: Apply outputs to workspace ──
@@ -259,7 +541,8 @@ func runPipeline(cmd *cobra.Command, args []string) error {
 			fmt.Println("\n📝 Applying outputs to workspace...")
 		}
 		for _, r := range results {
-			files, applyErr := app.Apply(r.Output, r.StepIndex)
+			requireContent := executor.RequiresContent(r.Step)
+			files, applyErr := app.ApplyStrict(r.Output, r.StepIndex, requireContent)
 			if applyErr != nil {
 				if !jsonMode {
 					fmt.Printf("  ⚠️  Apply error for step %d: %v\n", r.StepIndex+1, applyErr)
@@ -273,25 +556,49 @@ func runPipeline(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// ── Step 7: Save to memory ──
-	memStore.AddRecord(input, originalPlan.Steps, editedPlan.Steps, compiled.Keywords)
+	// ── Step 7: Rule-based validation ──
+	validationOK := true
+	validationReason := ""
+	if len(cfg.ValidationCommands) > 0 {
+		if !jsonMode {
+			fmt.Println("\n🧪 Running validation commands...")
+		}
+		ok, reason := validator.RunCommands(cfg.ValidationCommands, cfg.CommandAllow)
+		validationOK = ok
+		validationReason = reason
+		if !jsonMode {
+			if ok {
+				fmt.Println("  ✅ Validation passed")
+			} else {
+				fmt.Printf("  ❌ Validation failed: %s\n", reason)
+			}
+		}
+	}
+
+	// ── Step 8: Save to memory ──
+	memStore.AddRecord(input, origSteps, editedSteps, compiled.Keywords)
 	_ = memStore.Save()
 
 	// ── Output ──
 	if jsonMode {
 		// Machine-readable JSON output for Cline/Roo Code
 		output := map[string]interface{}{
-			"input":         input,
+			"input": input,
 			"config": map[string]string{
 				"provider": cfg.Provider,
 				"model":    cfg.Model,
 				"project":  cfg.ProjectPath,
 			},
-			"original_plan": originalPlan.Steps,
-			"final_plan":    editedPlan.Steps,
+			"original_plan": origSteps,
+			"final_plan":    editedSteps,
+			"plan":          editedPlan,
 			"results":       results,
 			"files_written": writtenFiles,
 			"plan_changed":  d.Changed,
+			"validation": map[string]interface{}{
+				"ok":     validationOK,
+				"reason": validationReason,
+			},
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -316,7 +623,51 @@ func runPipeline(cmd *cobra.Command, args []string) error {
 	if len(writtenFiles) > 0 {
 		fmt.Printf("   Files written:  %d\n", len(writtenFiles))
 	}
+	if len(cfg.ValidationCommands) > 0 {
+		if validationOK {
+			fmt.Println("   Validation:     passed")
+		} else {
+			fmt.Println("   Validation:     failed")
+		}
+	}
 	fmt.Println(strings.Repeat("─", 50))
 
 	return nil
+}
+
+func tasksToSteps(tasks []models.Task) []string {
+	var steps []string
+	for _, t := range tasks {
+		if strings.TrimSpace(t.Description) != "" {
+			steps = append(steps, strings.TrimSpace(t.Description))
+			continue
+		}
+		if strings.TrimSpace(t.Name) != "" {
+			steps = append(steps, strings.TrimSpace(t.Name))
+		}
+	}
+	return steps
+}
+
+func wrapContentAsFile(output string, taskDesc string) string {
+	trimmed := strings.TrimSpace(output)
+	if trimmed == "" {
+		return ""
+	}
+	l := strings.ToLower(taskDesc)
+	path := ""
+	switch {
+	case strings.Contains(l, "index.html"):
+		path = "index.html"
+	case strings.Contains(l, "styles.css") || strings.Contains(l, "style.css"):
+		path = "styles.css"
+	case strings.Contains(l, ".html"):
+		path = "index.html"
+	case strings.Contains(l, ".css"):
+		path = "styles.css"
+	}
+	if path == "" {
+		return ""
+	}
+	return "// FILE: " + path + "\n" + output + "\n// END FILE"
 }
