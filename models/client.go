@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -36,6 +37,49 @@ func (c *Client) Chat(systemPrompt, userPrompt string) (string, error) {
 			openai.ChatCompletionRequest{
 				Model:     c.model,
 				MaxTokens: c.maxTokens,
+				Messages: []openai.ChatCompletionMessage{
+					{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
+					{Role: openai.ChatMessageRoleUser, Content: userPrompt},
+				},
+			},
+		)
+		if err != nil {
+			lastErr = err
+			if attempt == 1 && isRetryable(err) {
+				continue
+			}
+			return "", fmt.Errorf("LLM call failed: %w", err)
+		}
+		if len(resp.Choices) == 0 {
+			return "", fmt.Errorf("LLM returned no choices")
+		}
+		return strings.TrimSpace(resp.Choices[0].Message.Content), nil
+	}
+	return "", fmt.Errorf("LLM call failed after retry: %w", lastErr)
+}
+
+// ChatWithOptions allows per-request max tokens and timeout overrides.
+func (c *Client) ChatWithOptions(systemPrompt, userPrompt string, maxTokens int, timeoutSeconds int) (string, error) {
+	limit := c.maxTokens
+	if maxTokens > 0 {
+		limit = maxTokens
+	}
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if timeoutSeconds > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
+		defer cancel()
+	} else {
+		ctx = context.Background()
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= 2; attempt++ {
+		resp, err := c.api.CreateChatCompletion(
+			ctx,
+			openai.ChatCompletionRequest{
+				Model:     c.model,
+				MaxTokens: limit,
 				Messages: []openai.ChatCompletionMessage{
 					{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 					{Role: openai.ChatMessageRoleUser, Content: userPrompt},

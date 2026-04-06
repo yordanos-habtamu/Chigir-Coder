@@ -14,34 +14,42 @@ import (
 
 // Executor runs plan steps one at a time through the LLM.
 type Executor struct {
-	client *models.Client
-	skill  string
-	allow  map[string]struct{}
+	client           *models.Client
+	skill            string
+	allow            map[string]struct{}
+	timeoutSeconds   int
+	maxTokensPerStep int
 }
 
 // New creates a new Executor.
-func New(client *models.Client, skill string, allowlist []string) *Executor {
+func New(client *models.Client, skill string, allowlist []string, timeoutSeconds int, maxTokensPerStep int) *Executor {
 	allow := make(map[string]struct{})
 	for _, c := range allowlist {
 		if t := strings.TrimSpace(c); t != "" {
 			allow[t] = struct{}{}
 		}
 	}
-	return &Executor{client: client, skill: skill, allow: allow}
+	return &Executor{
+		client:           client,
+		skill:            skill,
+		allow:            allow,
+		timeoutSeconds:   timeoutSeconds,
+		maxTokensPerStep: maxTokensPerStep,
+	}
 }
 
-// ExecuteStep sends a single plan step to the LLM with full plan context
-// and any existing code context.
-func (e *Executor) ExecuteStep(step string, stepIndex int, fullPlan []string, codeContext string) (*models.StepResult, error) {
-	userPrompt := prompts.ExecutorPrompt(step, stepIndex, fullPlan, codeContext, e.skill)
-	output, err := e.client.Chat(prompts.ExecutorSystem, userPrompt)
+// ExecuteStep sends a single task to the LLM with deterministic context.
+func (e *Executor) ExecuteStep(task models.Task, codeContext string) (*models.StepResult, error) {
+	requires := stepRequiresContent(task.Description)
+	userPrompt := prompts.ExecutorPrompt(task.Name, task.Description, codeContext, e.skill, requires)
+	output, err := e.client.ChatWithOptions(prompts.ExecutorSystem, userPrompt, e.maxTokensPerStep, e.timeoutSeconds)
 	if err != nil {
-		return nil, fmt.Errorf("execution of step %d failed: %w", stepIndex+1, err)
+		return nil, fmt.Errorf("execution of task %d failed: %w", task.ID, err)
 	}
-	if stepRequiresContent(step) && !hasFileOrPatch(output) {
+	if requires && !hasFileOrPatch(output) {
 		return &models.StepResult{
-			StepIndex: stepIndex,
-			Step:      step,
+			StepIndex: task.ID,
+			Step:      task.Description,
 			Output:    output,
 			Valid:     false,
 			Fixed:     false,
@@ -49,8 +57,8 @@ func (e *Executor) ExecuteStep(step string, stepIndex int, fullPlan []string, co
 	}
 
 	return &models.StepResult{
-		StepIndex: stepIndex,
-		Step:      step,
+		StepIndex: task.ID,
+		Step:      task.Description,
 		Output:    output,
 		Valid:     true, // will be checked by validator
 		Fixed:     false,
@@ -70,10 +78,25 @@ func (e *Executor) ExecuteAll(
 	ctx := initialContext
 	var results []models.StepResult
 
-	for i, step := range plan.Steps {
-		fmt.Printf("\n⚡ Executing step %d/%d: %s\n", i+1, len(plan.Steps), step)
+	var tasks []models.Task
+	if len(plan.Tasks) > 0 {
+		tasks = plan.Tasks
+	} else {
+		for i, s := range plan.Steps {
+			tasks = append(tasks, models.Task{
+				ID:          i + 1,
+				Name:        fmt.Sprintf("Task %d", i+1),
+				Description: s,
+				Status:      "pending",
+				MaxRetries:  1,
+			})
+		}
+	}
 
-		result, err := e.ExecuteStep(step, i, plan.Steps, ctx)
+	for i, task := range tasks {
+		fmt.Printf("\n⚡ Executing step %d/%d: %s\n", i+1, len(tasks), task.Description)
+
+		result, err := e.ExecuteStep(task, ctx)
 		if err != nil {
 			return results, err
 		}
@@ -86,20 +109,20 @@ func (e *Executor) ExecuteAll(
 			fmt.Printf("  ⚠️  Validation failed: %s\n", reason)
 			fmt.Println("  🔧 Attempting fix...")
 
-				fixed, fixErr := fixFn(result.Output, reason)
-				if fixErr != nil {
-					fmt.Printf("  ❌ Fix failed: %v\n", fixErr)
-				} else {
-					result.Output = fixed
-					result.Fixed = true
+			fixed, fixErr := fixFn(result.Output, reason)
+			if fixErr != nil {
+				fmt.Printf("  ❌ Fix failed: %v\n", fixErr)
+			} else {
+				result.Output = fixed
+				result.Fixed = true
 
 				// Re-validate after fix
-						valid2, reason2 := validateFn(fixed)
-						result.Valid = valid2
-						if !valid2 {
-							fmt.Printf("  ⚠️  Still invalid after fix: %s\n", reason2)
-						} else {
-							fmt.Println("  ✅ Fixed successfully")
+				valid2, reason2 := validateFn(fixed)
+				result.Valid = valid2
+				if !valid2 {
+					fmt.Printf("  ⚠️  Still invalid after fix: %s\n", reason2)
+				} else {
+					fmt.Println("  ✅ Fixed successfully")
 				}
 			}
 		} else {
@@ -140,7 +163,7 @@ func (e *Executor) ExecuteAll(
 						// Save fix output as a result so applier can write patches/files
 						results = append(results, models.StepResult{
 							StepIndex: i,
-							Step:      step,
+							Step:      task.Description,
 							Output:    fixedOutput,
 							Valid:     true,
 							Fixed:     true,
@@ -276,6 +299,16 @@ func hasFileOrPatch(output string) bool {
 
 func stepRequiresContent(step string) bool {
 	l := strings.ToLower(step)
+	// Folder-only tasks are not content tasks.
+	if (strings.Contains(l, "folder") || strings.Contains(l, "directory")) &&
+		!strings.Contains(l, ".html") &&
+		!strings.Contains(l, ".css") &&
+		!strings.Contains(l, ".js") &&
+		!strings.Contains(l, ".ts") &&
+		!strings.Contains(l, ".json") &&
+		!strings.Contains(l, ".md") {
+		return false
+	}
 	return strings.Contains(l, "create") ||
 		strings.Contains(l, "implement") ||
 		strings.Contains(l, "write") ||
