@@ -14,33 +14,31 @@ import (
 
 // Planner generates and edits execution plans via the LLM.
 type Planner struct {
-	client *models.Client
+	client    *models.Client
+	maxTokens int
 }
 
 // New creates a new Planner.
-func New(client *models.Client) *Planner {
-	return &Planner{client: client}
+func New(client *models.Client, maxTokens int) *Planner {
+	return &Planner{client: client, maxTokens: maxTokens}
 }
 
 // GeneratePlan asks the LLM to create a step-by-step plan from compiled input.
 func (p *Planner) GeneratePlan(compiledPrompt string, learningHints string, skill string) (*models.Plan, error) {
 	userPrompt := prompts.PlannerPrompt(compiledPrompt, learningHints, skill)
-	raw, err := p.client.Chat(prompts.PlannerSystem, userPrompt)
+	raw, err := p.client.ChatWithOptions(prompts.PlannerSystem, userPrompt, p.maxTokens, 0)
 	if err != nil {
 		return nil, fmt.Errorf("plan generation failed: %w", err)
 	}
-
-	steps := parseNumberedList(raw)
-	if len(steps) == 0 {
-		// Try to parse JSON array
-		steps = parseJSONArray(raw)
+	plan, err := parsePlanJSON(raw)
+	if err != nil {
+		return nil, fmt.Errorf("planner returned invalid JSON plan: %w\nRaw output:\n%s", err, raw)
 	}
-	if len(steps) == 0 {
-		return nil, fmt.Errorf("planner returned no steps. Raw output:\n%s", raw)
+	if len(plan.Tasks) == 0 {
+		return nil, fmt.Errorf("planner returned no tasks. Raw output:\n%s", raw)
 	}
-
-	steps = sanitizePlan(steps)
-	return &models.Plan{Steps: steps}, nil
+	plan.Tasks = sanitizeTasks(plan.Tasks)
+	return &plan, nil
 }
 
 // EditPlan writes the plan to a temp file, opens $EDITOR, and returns the
@@ -142,6 +140,23 @@ func sanitizePlan(steps []string) []string {
 	return out
 }
 
+func sanitizeTasks(tasks []models.Task) []models.Task {
+	seenMkdir := map[string]struct{}{}
+	var out []models.Task
+	for _, t := range tasks {
+		trim := strings.TrimSpace(t.Description)
+		lower := strings.ToLower(trim)
+		if dir := mkdirTarget(lower); dir != "" {
+			if _, ok := seenMkdir[dir]; ok {
+				continue
+			}
+			seenMkdir[dir] = struct{}{}
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
 func mkdirTarget(step string) string {
 	step = strings.TrimSpace(step)
 	if strings.HasPrefix(step, "mkdir -p ") {
@@ -153,17 +168,10 @@ func mkdirTarget(step string) string {
 	return ""
 }
 
-// parseJSONArray extracts steps from a JSON array like ["step 1", "step 2"].
-func parseJSONArray(text string) []string {
-	var steps []string
-	if err := json.Unmarshal([]byte(text), &steps); err != nil {
-		return nil
+func parsePlanJSON(text string) (models.Plan, error) {
+	var plan models.Plan
+	if err := json.Unmarshal([]byte(text), &plan); err != nil {
+		return models.Plan{}, err
 	}
-	var out []string
-	for _, s := range steps {
-		if t := strings.TrimSpace(s); t != "" {
-			out = append(out, t)
-		}
-	}
-	return out
+	return plan, nil
 }

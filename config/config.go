@@ -9,7 +9,6 @@ import (
 	"github.com/spf13/viper"
 )
 
-
 // Provider presets map provider names to their default base URLs.
 var ProviderPresets = map[string]string{
 	"openrouter": "https://openrouter.ai/api/v1",
@@ -26,26 +25,32 @@ var DefaultModels = map[string]string{
 	"openai":     "gpt-4o-mini",
 	"anthropic":  "claude-3-5-haiku-20241022",
 	// NVIDIA NIM/OpenAI-compatible models vary by account/region; set explicitly if needed.
-	"nvidia":     "qwen/qwen3.5-122b-a10b",
-	"ollama":     "qwen2.5-coder:7b",
-	"custom":     "gpt-4o-mini",
+	"nvidia": "qwen/qwen3.5-122b-a10b",
+	"ollama": "qwen2.5-coder:7b",
+	"custom": "gpt-4o-mini",
 }
 
 // Config holds all runtime configuration.
 type Config struct {
-	Provider       string `mapstructure:"provider"`
-	BaseURL        string `mapstructure:"base_url"`
-	APIKey         string `mapstructure:"api_key"`
-	Model          string `mapstructure:"model"`
-	Skill          string `mapstructure:"skill"`
-	ProjectPath    string `mapstructure:"project_path"`
-	MaxTokens      int    `mapstructure:"max_tokens"`
-	MaxFixRetries  int    `mapstructure:"max_fix_retries"`
-	ContextBudget  int    `mapstructure:"context_budget"`
-	CommandAllow  []string `mapstructure:"command_allowlist"`
-	OutputMode     string `mapstructure:"output_mode"` // "human" or "json"
-	MCPPort        int    `mapstructure:"mcp_port"`    // 0 = stdio transport
-	ConfigFile     string `mapstructure:"config_file"`
+	Provider           string   `mapstructure:"provider"`
+	BaseURL            string   `mapstructure:"base_url"`
+	APIKey             string   `mapstructure:"api_key"`
+	Model              string   `mapstructure:"model"`
+	Skill              string   `mapstructure:"skill"`
+	ProjectPath        string   `mapstructure:"project_path"`
+	MaxTokens          int      `mapstructure:"max_tokens"`
+	PlannerMaxTokens   int      `mapstructure:"planner_max_tokens"`
+	MaxFixRetries      int      `mapstructure:"max_fix_retries"`
+	ContextBudget      int      `mapstructure:"context_budget"`
+	CommandAllow       []string `mapstructure:"command_allowlist"`
+	ValidationCommands []string `mapstructure:"validation_commands"`
+	UseAIValidator     bool     `mapstructure:"use_ai_validator"`
+	UseAISupervisor    bool     `mapstructure:"use_ai_supervisor"`
+	TaskTimeoutSeconds int      `mapstructure:"task_timeout_seconds"`
+	MaxTokensPerStep   int      `mapstructure:"max_tokens_per_step"`
+	OutputMode         string   `mapstructure:"output_mode"` // "human" or "json"
+	MCPPort            int      `mapstructure:"mcp_port"`    // 0 = stdio transport
+	ConfigFile         string   `mapstructure:"config_file"`
 }
 
 // Load reads config from file, env vars, and applies provider presets.
@@ -61,9 +66,15 @@ func Load() (*Config, error) {
 	v.SetDefault("skill", "auto")
 	v.SetDefault("project_path", ".")
 	v.SetDefault("max_tokens", 300)
+	v.SetDefault("planner_max_tokens", 800)
 	v.SetDefault("max_fix_retries", 1)
 	v.SetDefault("context_budget", 800)
-	v.SetDefault("command_allowlist", []string{"ls", "pwd", "mkdir", "touch", "cat", "echo", "cp", "mv", "git", "go", "npm", "npx", "node", "python", "python3", "pip", "pip3"})
+	v.SetDefault("command_allowlist", []string{"ls", "pwd", "mkdir", "touch", "cat", "echo", "cp", "mv", "git", "go", "npm", "npx", "node", "pnpm", "yarn", "corepack", "bash", "sh", "python", "python3", "pip", "pip3"})
+	v.SetDefault("validation_commands", []string{})
+	v.SetDefault("use_ai_validator", false)
+	v.SetDefault("use_ai_supervisor", false)
+	v.SetDefault("task_timeout_seconds", 0)
+	v.SetDefault("max_tokens_per_step", 0)
 	v.SetDefault("output_mode", "human")
 	v.SetDefault("mcp_port", 0)
 
@@ -216,9 +227,15 @@ func (c *Config) Summary() string {
   Skill:       %s
   Project:     %s
   Max Tokens:  %d
+  Plan Tokens: %d
   Cmd Allow:   %v
+  Validate:    %v
+  AI Validate: %v
+  AI Supervise:%v
+  Task Timeout:%d
+  Step Tokens: %d
   Output Mode: %s
-  Config File: %s`, c.Provider, c.BaseURL, c.Model, maskedKey, c.Skill, c.ProjectPath, c.MaxTokens, c.CommandAllow, c.OutputMode, configFile)
+  Config File: %s`, c.Provider, c.BaseURL, c.Model, maskedKey, c.Skill, c.ProjectPath, c.MaxTokens, c.PlannerMaxTokens, c.CommandAllow, c.ValidationCommands, c.UseAIValidator, c.UseAISupervisor, c.TaskTimeoutSeconds, c.MaxTokensPerStep, c.OutputMode, configFile)
 }
 
 // ListProviders returns all supported provider names.

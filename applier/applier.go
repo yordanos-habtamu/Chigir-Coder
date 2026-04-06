@@ -2,6 +2,7 @@ package applier
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 
@@ -62,6 +63,18 @@ func (a *Applier) Apply(output string, stepIndex int) ([]string, error) {
 	return written, nil
 }
 
+// ApplyStrict enforces that content tasks must include file or patch blocks.
+// If requireContent is true and no file/patch blocks are present, it returns an error.
+func (a *Applier) ApplyStrict(output string, stepIndex int, requireContent bool) ([]string, error) {
+	patches := parsePatchBlocks(output)
+	blocks := parseFileBlocks(output)
+
+	if requireContent && len(patches) == 0 && len(blocks) == 0 {
+		return nil, fmt.Errorf("no // FILE or // PATCH blocks found for content task")
+	}
+	return a.Apply(output, stepIndex)
+}
+
 // parseFileBlocks extracts file path → content mappings from LLM output.
 func parseFileBlocks(output string) map[string]string {
 	blocks := make(map[string]string)
@@ -106,12 +119,13 @@ type patchBlock struct {
 
 // parsePatchBlocks extracts patch operations from LLM output.
 // Format:
-//   // PATCH: path
-//   // SEARCH:
-//   ...
-//   // REPLACE:
-//   ...
-//   // END PATCH
+//
+//	// PATCH: path
+//	// SEARCH:
+//	...
+//	// REPLACE:
+//	...
+//	// END PATCH
 func parsePatchBlocks(output string) []patchBlock {
 	var patches []patchBlock
 	re := regexp.MustCompile(`(?ms)//\s*PATCH:\s*(.+?)\n//\s*SEARCH:\n(.*?)//\s*REPLACE:\n(.*?)//\s*END\s*PATCH`)
@@ -119,7 +133,7 @@ func parsePatchBlocks(output string) []patchBlock {
 	for _, m := range matches {
 		p := patchBlock{
 			Path:    strings.TrimSpace(m[1]),
-			Search: m[2],
+			Search:  m[2],
 			Replace: m[3],
 		}
 		patches = append(patches, p)
@@ -133,6 +147,13 @@ func (a *Applier) applyPatch(p patchBlock) error {
 	}
 	current, err := a.ws.ReadFile(p.Path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			if strings.TrimSpace(p.Replace) == "" {
+				return err
+			}
+			// Fallback: create the file with replacement content.
+			return a.ws.WriteFile(p.Path, p.Replace)
+		}
 		return err
 	}
 	if p.Search == "" {
